@@ -6,15 +6,40 @@ import {
   TextInput,
   TouchableOpacity,
   ScrollView,
+  Image,
 } from "react-native";
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
+
+type ViewMode = "text" | "bytes" | "image";
+
+interface MessageData {
+  timestamp: string;
+  data: string;
+  type: "system" | "data";
+}
 
 export default function App() {
   const [ip, setIp] = useState("192.168.1.1");
   const [port, setPort] = useState("8080");
-  const [messages, setMessages] = useState<string[]>([]);
+  const [messages, setMessages] = useState<MessageData[]>([]);
   const [isConnected, setIsConnected] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("text");
   const websocket = useRef<WebSocket | null>(null);
+  const scrollViewRef = useRef<ScrollView>(null);
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    if (scrollViewRef.current) {
+      scrollViewRef.current.scrollToEnd({ animated: true });
+    }
+  }, [messages]);
+
+  // Clear console when view mode changes
+  const changeViewMode = (mode: ViewMode) => {
+    setViewMode(mode);
+    // Keep only system messages when switching modes
+    setMessages((prev) => prev.filter((msg) => msg.type === "system"));
+  };
 
   const connectWebSocket = () => {
     if (websocket.current) {
@@ -22,38 +47,73 @@ export default function App() {
     }
 
     const wsUrl = `ws://${ip}:${port}`;
-    setMessages([`Connecting to ${wsUrl}...`]);
+    setMessages([
+      {
+        timestamp: new Date().toLocaleTimeString(),
+        data: `Connecting to ${wsUrl}...`,
+        type: "system",
+      },
+    ]);
 
     try {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
         setIsConnected(true);
-        setMessages((prev) => [...prev, `✅ Connected to ${wsUrl}`]);
+        setMessages((prev) => [
+          ...prev,
+          {
+            timestamp: new Date().toLocaleTimeString(),
+            data: `✅ Connected to ${wsUrl}`,
+            type: "system",
+          },
+        ]);
       };
 
       ws.onmessage = (event) => {
         const timestamp = new Date().toLocaleTimeString();
-        setMessages((prev) => [...prev, `[${timestamp}] ${event.data}`]);
+        setMessages((prev) => [
+          ...prev,
+          {
+            timestamp,
+            data: event.data,
+            type: "data",
+          },
+        ]);
       };
 
       ws.onerror = (error) => {
         setMessages((prev) => [
           ...prev,
-          `❌ Error: ${error.message || "Connection error"}`,
+          {
+            timestamp: new Date().toLocaleTimeString(),
+            data: `❌ Error: ${error.message || "Connection error"}`,
+            type: "system",
+          },
         ]);
       };
 
       ws.onclose = () => {
         setIsConnected(false);
-        setMessages((prev) => [...prev, "🔌 Connection closed"]);
+        setMessages((prev) => [
+          ...prev,
+          {
+            timestamp: new Date().toLocaleTimeString(),
+            data: "🔌 Connection closed",
+            type: "system",
+          },
+        ]);
       };
 
       websocket.current = ws;
     } catch (error: any) {
       setMessages((prev) => [
         ...prev,
-        `❌ Failed to connect: ${error.message}`,
+        {
+          timestamp: new Date().toLocaleTimeString(),
+          data: `❌ Failed to connect: ${error.message}`,
+          type: "system",
+        },
       ]);
     }
   };
@@ -65,79 +125,197 @@ export default function App() {
     }
   };
 
+  const stringToHex = (str: string): string => {
+    let hex = "";
+    for (let i = 0; i < str.length; i++) {
+      const byte = str.charCodeAt(i).toString(16).padStart(2, "0");
+      hex += byte + " ";
+      if ((i + 1) % 16 === 0) hex += "\n";
+    }
+    return hex;
+  };
+
+  const isBase64Image = (str: string): boolean => {
+    return (
+      str.startsWith("data:image/") ||
+      (str.length > 100 && /^[A-Za-z0-9+/]+=*$/.test(str.substring(0, 100)))
+    );
+  };
+
+  const renderMessage = (msg: MessageData, index: number) => {
+    if (msg.type === "system") {
+      return (
+        <Text key={index} style={styles.systemMessage}>
+          [{msg.timestamp}] {msg.data}
+        </Text>
+      );
+    }
+
+    switch (viewMode) {
+      case "text":
+        return (
+          <Text key={index} style={styles.message}>
+            [{msg.timestamp}] {msg.data}
+          </Text>
+        );
+
+      case "bytes":
+        return (
+          <Text key={index} style={styles.bytesMessage}>
+            [{msg.timestamp}]{"\n"}
+            {stringToHex(msg.data)}
+          </Text>
+        );
+
+      case "image":
+        if (isBase64Image(msg.data)) {
+          const imageUri = msg.data.startsWith("data:")
+            ? msg.data
+            : `data:image/png;base64,${msg.data}`;
+          return (
+            <View key={index} style={styles.imageContainer}>
+              <Text style={styles.imageTimestamp}>[{msg.timestamp}]</Text>
+              <Image
+                source={{ uri: imageUri }}
+                style={styles.image}
+                resizeMode="contain"
+              />
+            </View>
+          );
+        } else {
+          return (
+            <Text key={index} style={styles.message}>
+              [{msg.timestamp}] {msg.data.substring(0, 100)}...
+            </Text>
+          );
+        }
+
+      default:
+        return (
+          <Text key={index} style={styles.message}>
+            [{msg.timestamp}] {msg.data}
+          </Text>
+        );
+    }
+  };
+
   return (
     <View style={styles.container}>
       <StatusBar style="auto" />
 
-      <View style={styles.inputContainer}>
-        <Text style={styles.title}>WebSocket Debug Client</Text>
+      {/* Connection Component */}
+      {!isConnected ? (
+        <View style={styles.connectionContainer}>
+          <Text style={styles.title}>WebSocket Debug Client</Text>
 
-        <View style={styles.inputRow}>
-          <Text style={styles.label}>IP:</Text>
-          <TextInput
-            style={styles.input}
-            value={ip}
-            onChangeText={setIp}
-            placeholder="192.168.1.1"
-            autoCapitalize="none"
-            editable={!isConnected}
-          />
-        </View>
+          <View style={styles.inputRow}>
+            <Text style={styles.label}>IP:</Text>
+            <TextInput
+              style={styles.input}
+              value={ip}
+              onChangeText={setIp}
+              placeholder="192.168.1.1"
+              autoCapitalize="none"
+            />
+          </View>
 
-        <View style={styles.inputRow}>
-          <Text style={styles.label}>Port:</Text>
-          <TextInput
-            style={styles.input}
-            value={port}
-            onChangeText={setPort}
-            placeholder="8080"
-            keyboardType="numeric"
-            editable={!isConnected}
-          />
-        </View>
+          <View style={styles.inputRow}>
+            <Text style={styles.label}>Port:</Text>
+            <TextInput
+              style={styles.input}
+              value={port}
+              onChangeText={setPort}
+              placeholder="8080"
+              keyboardType="numeric"
+            />
+          </View>
 
-        <View style={styles.buttonRow}>
           <TouchableOpacity
-            style={[styles.button, isConnected && styles.buttonDisabled]}
+            style={styles.connectButton}
             onPress={connectWebSocket}
-            disabled={isConnected}
           >
-            <Text style={styles.buttonText}>OK</Text>
+            <Text style={styles.buttonText}>Connect</Text>
           </TouchableOpacity>
-
+        </View>
+      ) : (
+        <View style={styles.headerContainer}>
+          <View style={styles.headerInfo}>
+            <Text style={styles.headerTitle}>🟢 Connected</Text>
+            <Text style={styles.headerSubtitle}>
+              ws://{ip}:{port}
+            </Text>
+          </View>
           <TouchableOpacity
-            style={[
-              styles.button,
-              styles.disconnectButton,
-              !isConnected && styles.buttonDisabled,
-            ]}
+            style={styles.disconnectButton}
             onPress={disconnect}
-            disabled={!isConnected}
           >
             <Text style={styles.buttonText}>Disconnect</Text>
           </TouchableOpacity>
         </View>
+      )}
 
-        <View style={styles.statusContainer}>
-          <Text
-            style={[styles.statusText, isConnected && styles.statusConnected]}
-          >
-            {isConnected ? "🟢 Connected" : "🔴 Disconnected"}
-          </Text>
+      {/* Console Component */}
+      <View style={styles.consoleContainer}>
+        <View style={styles.consoleHeader}>
+          <Text style={styles.consoleTitle}>Console</Text>
+          <View style={styles.modeSelector}>
+            <TouchableOpacity
+              style={[
+                styles.modeButton,
+                viewMode === "text" && styles.modeButtonActive,
+              ]}
+              onPress={() => changeViewMode("text")}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  viewMode === "text" && styles.modeButtonTextActive,
+                ]}
+              >
+                Text
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.modeButton,
+                viewMode === "bytes" && styles.modeButtonActive,
+              ]}
+              onPress={() => changeViewMode("bytes")}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  viewMode === "bytes" && styles.modeButtonTextActive,
+                ]}
+              >
+                Bytes
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.modeButton,
+                viewMode === "image" && styles.modeButtonActive,
+              ]}
+              onPress={() => changeViewMode("image")}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  viewMode === "image" && styles.modeButtonTextActive,
+                ]}
+              >
+                &lt;/&gt;
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
-      </View>
 
-      <View style={styles.messagesContainer}>
-        <Text style={styles.messagesTitle}>Messages:</Text>
         <ScrollView
-          style={styles.messagesScroll}
-          contentContainerStyle={styles.messagesContent}
+          ref={scrollViewRef}
+          style={styles.consoleScroll}
+          contentContainerStyle={styles.consoleContent}
         >
-          {messages.map((msg, index) => (
-            <Text key={index} style={styles.message}>
-              {msg}
-            </Text>
-          ))}
+          {messages.map((msg, index) => renderMessage(msg, index))}
         </ScrollView>
       </View>
     </View>
@@ -147,26 +325,22 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#f5f5f5",
+    backgroundColor: "#1e1e1e",
     paddingTop: 50,
   },
-  inputContainer: {
-    backgroundColor: "#fff",
+  // Connection Screen Styles
+  connectionContainer: {
+    backgroundColor: "#2d2d2d",
     padding: 20,
     margin: 10,
     borderRadius: 10,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
   },
   title: {
     fontSize: 20,
     fontWeight: "bold",
     marginBottom: 20,
     textAlign: "center",
-    color: "#333",
+    color: "#fff",
   },
   inputRow: {
     flexDirection: "row",
@@ -177,87 +351,165 @@ const styles = StyleSheet.create({
     width: 60,
     fontSize: 16,
     fontWeight: "600",
-    color: "#333",
+    color: "#ddd",
   },
   input: {
     flex: 1,
     borderWidth: 1,
-    borderColor: "#ddd",
+    borderColor: "#444",
     borderRadius: 5,
     padding: 10,
     fontSize: 16,
-    backgroundColor: "#fff",
+    backgroundColor: "#1e1e1e",
+    color: "#fff",
   },
-  buttonRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginTop: 10,
-  },
-  button: {
-    flex: 1,
+  connectButton: {
     backgroundColor: "#007AFF",
     padding: 15,
     borderRadius: 5,
     alignItems: "center",
-    marginHorizontal: 5,
+    marginTop: 10,
+  },
+  // Header Styles (when connected)
+  headerContainer: {
+    backgroundColor: "#2d2d2d",
+    padding: 15,
+    margin: 10,
+    borderRadius: 10,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  headerInfo: {
+    flex: 1,
+  },
+  headerTitle: {
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#4CAF50",
+    marginBottom: 4,
+  },
+  headerSubtitle: {
+    fontSize: 12,
+    color: "#888",
+    fontFamily: "monospace",
   },
   disconnectButton: {
     backgroundColor: "#FF3B30",
-  },
-  buttonDisabled: {
-    backgroundColor: "#ccc",
-    opacity: 0.6,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 5,
   },
   buttonText: {
     color: "#fff",
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: "600",
   },
-  statusContainer: {
-    marginTop: 15,
-    alignItems: "center",
-  },
-  statusText: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: "#FF3B30",
-  },
-  statusConnected: {
-    color: "#34C759",
-  },
-  messagesContainer: {
+  // Console Styles
+  consoleContainer: {
     flex: 1,
-    backgroundColor: "#fff",
+    backgroundColor: "#0d1117",
     margin: 10,
     marginTop: 0,
     borderRadius: 10,
-    padding: 15,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
+    overflow: "hidden",
   },
-  messagesTitle: {
-    fontSize: 18,
+  consoleHeader: {
+    backgroundColor: "#161b22",
+    padding: 12,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363d",
+  },
+  consoleTitle: {
+    fontSize: 16,
     fontWeight: "bold",
-    marginBottom: 10,
-    color: "#333",
+    color: "#c9d1d9",
   },
-  messagesScroll: {
+  modeSelector: {
+    flexDirection: "row",
+    gap: 5,
+  },
+  modeButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 5,
+    backgroundColor: "#21262d",
+    borderWidth: 1,
+    borderColor: "#30363d",
+  },
+  modeButtonActive: {
+    backgroundColor: "#1f6feb",
+    borderColor: "#1f6feb",
+  },
+  modeButtonText: {
+    fontSize: 12,
+    color: "#8b949e",
+    fontWeight: "600",
+  },
+  modeButtonTextActive: {
+    color: "#fff",
+  },
+  consoleScroll: {
     flex: 1,
   },
-  messagesContent: {
-    paddingBottom: 10,
+  consoleContent: {
+    padding: 10,
   },
-  message: {
-    fontSize: 14,
+  // Message Styles
+  systemMessage: {
+    fontSize: 13,
     marginBottom: 8,
     padding: 8,
-    backgroundColor: "#f9f9f9",
+    backgroundColor: "#161b22",
     borderRadius: 5,
     borderLeftWidth: 3,
-    borderLeftColor: "#007AFF",
+    borderLeftColor: "#ffa657",
     fontFamily: "monospace",
+    color: "#ffa657",
+  },
+  message: {
+    fontSize: 13,
+    marginBottom: 8,
+    padding: 8,
+    backgroundColor: "#0d1117",
+    borderRadius: 5,
+    borderLeftWidth: 3,
+    borderLeftColor: "#58a6ff",
+    fontFamily: "monospace",
+    color: "#c9d1d9",
+  },
+  bytesMessage: {
+    fontSize: 11,
+    marginBottom: 8,
+    padding: 8,
+    backgroundColor: "#0d1117",
+    borderRadius: 5,
+    borderLeftWidth: 3,
+    borderLeftColor: "#f85149",
+    fontFamily: "monospace",
+    color: "#7ee787",
+  },
+  imageContainer: {
+    marginBottom: 12,
+    padding: 10,
+    backgroundColor: "#161b22",
+    borderRadius: 8,
+    borderLeftWidth: 3,
+    borderLeftColor: "#a371f7",
+  },
+  imageTimestamp: {
+    fontSize: 11,
+    color: "#8b949e",
+    marginBottom: 8,
+    fontFamily: "monospace",
+  },
+  image: {
+    width: "100%",
+    height: 200,
+    borderRadius: 5,
+    backgroundColor: "#0d1117",
   },
 });
