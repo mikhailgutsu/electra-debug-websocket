@@ -80,7 +80,7 @@ export default function App() {
         height,
       };
     } catch (e) {
-      console.error('MYIR parse error:', e);
+      console.error("MYIR parse error:", e);
       return null;
     }
   };
@@ -116,7 +116,7 @@ export default function App() {
     try {
       const ws = new WebSocket(wsUrl);
       // Set binary type to arraybuffer for React Native
-      (ws as any).binaryType = 'arraybuffer';
+      (ws as any).binaryType = "arraybuffer";
 
       ws.onopen = () => {
         setIsConnected(true);
@@ -188,7 +188,7 @@ export default function App() {
         } else if (event.data instanceof Blob) {
           // Browser fallback
           event.data.arrayBuffer().then(processBuffer);
-        } else if (typeof event.data === 'string') {
+        } else if (typeof event.data === "string") {
           // Check if it's base64 encoded binary
           try {
             // Try to decode as base64
@@ -295,9 +295,12 @@ export default function App() {
     // Render stream info if available
     const streamInfoLine = msg.streamInfo ? (
       <Text style={styles.streamInfo}>
-        Stream: Frame #{msg.streamInfo.frameId} | Chunk {msg.streamInfo.chunkId + 1}/{msg.streamInfo.chunksTotal} | Progress [{
-          frameStates.current.get(msg.streamInfo.frameId)?.receivedChunks.size || 0
-        }/{msg.streamInfo.chunksTotal}] | Size: {msg.streamInfo.frameSize} bytes | Resolution: {msg.streamInfo.width}x{msg.streamInfo.height}
+        Stream: Frame #{msg.streamInfo.frameId} | Chunk{" "}
+        {msg.streamInfo.chunkId + 1}/{msg.streamInfo.chunksTotal} | Progress [
+        {frameStates.current.get(msg.streamInfo.frameId)?.receivedChunks.size ||
+          0}
+        /{msg.streamInfo.chunksTotal}] | Size: {msg.streamInfo.frameSize} bytes
+        | Resolution: {msg.streamInfo.width}x{msg.streamInfo.height}
       </Text>
     ) : null;
 
@@ -313,19 +316,19 @@ export default function App() {
         );
 
       case "bytes":
-        const hexData = msg.binaryData 
+        const hexData = msg.binaryData
           ? Array.from(msg.binaryData.slice(0, 256))
-              .map((b) => b.toString(16).padStart(2, '0'))
-              .join(' ')
-              .match(/.{1,48}/g)?.join('\n') || ''
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join(" ")
+              .match(/.{1,48}/g)
+              ?.join("\n") || ""
           : stringToHex(msg.data.substring(0, 256));
         return (
           <View key={index} style={styles.messageContainer}>
             <Text style={styles.bytesMessage}>
-              [{msg.timestamp}]
-              {"\n"}
+              [{msg.timestamp}]{"\n"}
               {hexData}
-              {msg.binaryData && msg.binaryData.length > 256 ? '\n...' : ''}
+              {msg.binaryData && msg.binaryData.length > 256 ? "\n..." : ""}
             </Text>
             {streamInfoLine}
           </View>
@@ -338,9 +341,7 @@ export default function App() {
             : `data:image/png;base64,${msg.data}`;
           return (
             <View key={index} style={styles.imageContainer}>
-              <Text style={styles.imageTimestamp}>
-                [{msg.timestamp}]
-              </Text>
+              <Text style={styles.imageTimestamp}>[{msg.timestamp}]</Text>
               {streamInfoLine}
               <Image
                 source={{ uri: imageUri }}
@@ -365,9 +366,7 @@ export default function App() {
         if (!msg.streamInfo) return null;
         return (
           <View key={index} style={styles.messageContainer}>
-            <Text style={styles.streamMessage}>
-              [{msg.timestamp}]
-            </Text>
+            <Text style={styles.streamMessage}>[{msg.timestamp}]</Text>
             {streamInfoLine}
           </View>
         );
