@@ -35,15 +35,107 @@ interface FrameState {
   frameSize: number;
 }
 
+// Frame Assembler - собирает чанки в один фрейм
+class FrameAssembler {
+  buffer: Uint8Array;
+  receivedChunks: Set<number>;
+  totalChunks: number;
+  frameSize: number;
+  frameId: number;
+  width: number;
+  height: number;
+  lastUpdate: number;
+  chunkPayloadSize: number = 1200; // CHUNK_PAYLOAD из C++
+
+  constructor(header: StreamInfo) {
+    this.frameId = header.frameId;
+    this.frameSize = header.frameSize;
+    this.totalChunks = header.chunksTotal;
+    this.width = header.width;
+    this.height = header.height;
+    this.buffer = new Uint8Array(header.frameSize);
+    this.receivedChunks = new Set();
+    this.lastUpdate = Date.now();
+  }
+
+  addChunk(chunkId: number, payload: Uint8Array): boolean {
+    if (chunkId >= this.totalChunks) return false;
+    if (this.receivedChunks.has(chunkId)) return false;
+
+    // Копируем payload в буфер по смещению
+    const offset = chunkId * this.chunkPayloadSize;
+    this.buffer.set(payload, offset);
+    this.receivedChunks.add(chunkId);
+    this.lastUpdate = Date.now();
+
+    return this.isComplete();
+  }
+
+  isComplete(): boolean {
+    return this.receivedChunks.size === this.totalChunks;
+  }
+
+  getJpegData(): Uint8Array {
+    return this.buffer;
+  }
+}
+
+// Reassembler - управляет несколькими фреймами
+class Reassembler {
+  frames: Map<number, FrameAssembler>;
+  maxFrames: number;
+
+  constructor(maxFrames: number = 8) {
+    this.frames = new Map();
+    this.maxFrames = maxFrames;
+  }
+
+  push(header: StreamInfo, payload: Uint8Array): FrameAssembler | null {
+    let frame = this.frames.get(header.frameId);
+
+    if (!frame) {
+      frame = new FrameAssembler(header);
+      this.frames.set(header.frameId, frame);
+    }
+
+    const isComplete = frame.addChunk(header.chunkId, payload);
+
+    if (isComplete) {
+      this.frames.delete(header.frameId);
+      return frame;
+    }
+
+    return null;
+  }
+
+  gc(maxAgeMs: number = 1000): void {
+    const now = Date.now();
+    if (this.frames.size <= this.maxFrames) return;
+
+    const toDelete: number[] = [];
+    this.frames.forEach((frame, frameId) => {
+      if (now - frame.lastUpdate > maxAgeMs) {
+        toDelete.push(frameId);
+      }
+    });
+
+    toDelete.forEach((frameId) => this.frames.delete(frameId));
+  }
+}
+
 export default function App() {
   const [ip, setIp] = useState("185.181.228.243");
   const [port, setPort] = useState("39181");
   const [messages, setMessages] = useState<MessageData[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("text");
+  const [currentFrame, setCurrentFrame] = useState<string | null>(null); // base64 JPEG
+  const [fps, setFps] = useState<number>(0);
   const websocket = useRef<WebSocket | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
   const frameStates = useRef<Map<number, FrameState>>(new Map());
+  const reassembler = useRef<Reassembler>(new Reassembler());
+  const fpsCounter = useRef({ count: 0, lastTime: Date.now() });
 
   // MYIR Protocol Constants
   const MYIR_MAGIC = 0x4d594952;
@@ -83,6 +175,16 @@ export default function App() {
       console.error("MYIR parse error:", e);
       return null;
     }
+  };
+
+  // Convert Uint8Array to base64 string
+  const uint8ArrayToBase64 = (bytes: Uint8Array): string => {
+    let binary = "";
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
   };
 
   // Auto-scroll to bottom when new messages arrive
@@ -138,7 +240,7 @@ export default function App() {
           const header = parseMyirHeader(buffer);
 
           if (header) {
-            // Update frame state
+            // Update frame state for UI
             let frameState = frameStates.current.get(header.frameId);
             if (!frameState) {
               frameState = {
@@ -150,7 +252,45 @@ export default function App() {
             }
             frameState.receivedChunks.add(header.chunkId);
 
-            // Clean up old frames (keep only last 10)
+            // Extract payload (skip 32-byte header)
+            const HDR_SIZE = 32;
+            const payloadLen = buffer.byteLength - HDR_SIZE;
+            const payload = new Uint8Array(buffer, HDR_SIZE, payloadLen);
+
+            // Push to reassembler
+            const completeFrame = reassembler.current.push(header, payload);
+
+            if (completeFrame) {
+              // Frame complete! Convert to base64 for Image component
+              const jpegData = completeFrame.getJpegData();
+              const base64 = uint8ArrayToBase64(jpegData);
+              const imageUri = `data:image/jpeg;base64,${base64}`;
+
+              setCurrentFrame(imageUri);
+
+              // Update FPS counter
+              fpsCounter.current.count++;
+              const now = Date.now();
+              const elapsed = now - fpsCounter.current.lastTime;
+              if (elapsed >= 1000) {
+                const currentFps = (fpsCounter.current.count * 1000) / elapsed;
+                setFps(Math.round(currentFps * 10) / 10);
+                fpsCounter.current.count = 0;
+                fpsCounter.current.lastTime = now;
+              }
+
+              // Clean up old frame states
+              frameStates.current.delete(header.frameId);
+
+              console.log(
+                `✅ Frame ${header.frameId} complete: ${header.width}x${header.height}, FPS: ${fps}`,
+              );
+            }
+
+            // GC old incomplete frames
+            reassembler.current.gc();
+
+            // Clean up old frame states (keep only last 10)
             if (frameStates.current.size > 10) {
               const oldestFrame = Math.min(...frameStates.current.keys());
               frameStates.current.delete(oldestFrame);
@@ -161,7 +301,7 @@ export default function App() {
               ...prev,
               {
                 timestamp,
-                data: `Binary chunk: ${buffer.byteLength} bytes`,
+                data: `Chunk ${header.chunkId + 1}/${header.chunksTotal}`,
                 type: "data",
                 streamInfo: header,
                 binaryData: new Uint8Array(buffer),
@@ -223,12 +363,12 @@ export default function App() {
         }
       };
 
-      ws.onerror = (error) => {
+      ws.onerror = (error: Event) => {
         setMessages((prev) => [
           ...prev,
           {
             timestamp: new Date().toLocaleTimeString(),
-            data: `❌ Error: ${error.message || "Connection error"}`,
+            data: `❌ Error: Connection error`,
             type: "system",
           },
         ]);
@@ -438,6 +578,21 @@ export default function App() {
         </View>
       )}
 
+      {/* Live Video Stream */}
+      {isConnected && currentFrame && (
+        <View style={styles.videoContainer}>
+          <View style={styles.videoHeader}>
+            <Text style={styles.videoTitle}>📹 Live Stream</Text>
+            <Text style={styles.fpsText}>{fps.toFixed(1)} FPS</Text>
+          </View>
+          <Image
+            source={{ uri: currentFrame }}
+            style={styles.videoFrame}
+            resizeMode="contain"
+          />
+        </View>
+      )}
+
       {/* Console Component */}
       <View style={styles.consoleContainer}>
         <View style={styles.consoleHeader}>
@@ -604,6 +759,39 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontSize: 14,
     fontWeight: "600",
+  },
+  // Video Stream Styles
+  videoContainer: {
+    backgroundColor: "#0d1117",
+    margin: 10,
+    marginTop: 0,
+    borderRadius: 10,
+    overflow: "hidden",
+  },
+  videoHeader: {
+    backgroundColor: "#161b22",
+    padding: 10,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363d",
+  },
+  videoTitle: {
+    fontSize: 14,
+    fontWeight: "bold",
+    color: "#c9d1d9",
+  },
+  fpsText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#58a6ff",
+    fontFamily: "monospace",
+  },
+  videoFrame: {
+    width: "100%",
+    height: 250,
+    backgroundColor: "#000",
   },
   // Console Styles
   consoleContainer: {
