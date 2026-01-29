@@ -10,22 +10,80 @@ import {
 } from "react-native";
 import { useState, useRef, useEffect } from "react";
 
-type ViewMode = "text" | "bytes" | "image";
+type ViewMode = "text" | "bytes" | "image" | "stream";
 
 interface MessageData {
   timestamp: string;
   data: string;
   type: "system" | "data";
+  streamInfo?: StreamInfo;
+  binaryData?: Uint8Array;
+}
+
+interface StreamInfo {
+  frameId: number;
+  chunkId: number;
+  chunksTotal: number;
+  frameSize: number;
+  width: number;
+  height: number;
+}
+
+interface FrameState {
+  receivedChunks: Set<number>;
+  totalChunks: number;
+  frameSize: number;
 }
 
 export default function App() {
-  const [ip, setIp] = useState("192.168.1.1");
-  const [port, setPort] = useState("8080");
+  const [ip, setIp] = useState("185.181.228.243");
+  const [port, setPort] = useState("39181");
   const [messages, setMessages] = useState<MessageData[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("text");
   const websocket = useRef<WebSocket | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
+  const frameStates = useRef<Map<number, FrameState>>(new Map());
+
+  // MYIR Protocol Constants
+  const MYIR_MAGIC = 0x4d594952;
+  const MYIR_VER = 3;
+
+  // Parse MYIR header from binary data
+  const parseMyirHeader = (data: ArrayBuffer): StreamInfo | null => {
+    try {
+      if (data.byteLength < 32) return null;
+
+      const view = new DataView(data);
+      const magic = view.getUint32(0, false); // big-endian
+
+      if (magic !== MYIR_MAGIC) return null;
+
+      const ver = view.getUint8(4);
+      if (ver !== MYIR_VER) return null;
+
+      // Skip: stream(1), codec(1), flags(1)
+      const width = view.getUint16(8, false);
+      const height = view.getUint16(10, false);
+      // Skip: pts(8)
+      const frameId = view.getUint32(20, false);
+      const frameSize = view.getUint32(24, false);
+      const chunkId = view.getUint16(28, false);
+      const chunksTotal = view.getUint16(30, false);
+
+      return {
+        frameId,
+        chunkId,
+        chunksTotal,
+        frameSize,
+        width,
+        height,
+      };
+    } catch (e) {
+      console.error('MYIR parse error:', e);
+      return null;
+    }
+  };
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -57,6 +115,8 @@ export default function App() {
 
     try {
       const ws = new WebSocket(wsUrl);
+      // Set binary type to arraybuffer for React Native
+      (ws as any).binaryType = 'arraybuffer';
 
       ws.onopen = () => {
         setIsConnected(true);
@@ -72,14 +132,95 @@ export default function App() {
 
       ws.onmessage = (event) => {
         const timestamp = new Date().toLocaleTimeString();
-        setMessages((prev) => [
-          ...prev,
-          {
-            timestamp,
-            data: event.data,
-            type: "data",
-          },
-        ]);
+
+        // Try to parse as binary MYIR protocol
+        const processBuffer = (buffer: ArrayBuffer) => {
+          const header = parseMyirHeader(buffer);
+
+          if (header) {
+            // Update frame state
+            let frameState = frameStates.current.get(header.frameId);
+            if (!frameState) {
+              frameState = {
+                receivedChunks: new Set(),
+                totalChunks: header.chunksTotal,
+                frameSize: header.frameSize,
+              };
+              frameStates.current.set(header.frameId, frameState);
+            }
+            frameState.receivedChunks.add(header.chunkId);
+
+            // Clean up old frames (keep only last 10)
+            if (frameStates.current.size > 10) {
+              const oldestFrame = Math.min(...frameStates.current.keys());
+              frameStates.current.delete(oldestFrame);
+            }
+
+            // Add message with stream info
+            setMessages((prev) => [
+              ...prev,
+              {
+                timestamp,
+                data: `Binary chunk: ${buffer.byteLength} bytes`,
+                type: "data",
+                streamInfo: header,
+                binaryData: new Uint8Array(buffer),
+              },
+            ]);
+          } else {
+            // Not MYIR protocol
+            setMessages((prev) => [
+              ...prev,
+              {
+                timestamp,
+                data: `Binary data: ${buffer.byteLength} bytes (not MYIR)`,
+                type: "data",
+                binaryData: new Uint8Array(buffer),
+              },
+            ]);
+          }
+        };
+
+        // Handle different data types
+        if (event.data instanceof ArrayBuffer) {
+          // React Native with binaryType='arraybuffer'
+          processBuffer(event.data);
+        } else if (event.data instanceof Blob) {
+          // Browser fallback
+          event.data.arrayBuffer().then(processBuffer);
+        } else if (typeof event.data === 'string') {
+          // Check if it's base64 encoded binary
+          try {
+            // Try to decode as base64
+            const binaryString = atob(event.data);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            processBuffer(bytes.buffer);
+          } catch (e) {
+            // Text data
+            setMessages((prev) => [
+              ...prev,
+              {
+                timestamp,
+                data: event.data,
+                type: "data",
+              },
+            ]);
+          }
+        } else {
+          // Unknown format - text fallback
+          setMessages((prev) => [
+            ...prev,
+            {
+              timestamp,
+              data: String(event.data),
+              type: "data",
+            },
+          ]);
+        }
       };
 
       ws.onerror = (error) => {
@@ -151,20 +292,43 @@ export default function App() {
       );
     }
 
+    // Render stream info if available
+    const streamInfoLine = msg.streamInfo ? (
+      <Text style={styles.streamInfo}>
+        Stream: Frame #{msg.streamInfo.frameId} | Chunk {msg.streamInfo.chunkId + 1}/{msg.streamInfo.chunksTotal} | Progress [{
+          frameStates.current.get(msg.streamInfo.frameId)?.receivedChunks.size || 0
+        }/{msg.streamInfo.chunksTotal}] | Size: {msg.streamInfo.frameSize} bytes | Resolution: {msg.streamInfo.width}x{msg.streamInfo.height}
+      </Text>
+    ) : null;
+
     switch (viewMode) {
       case "text":
         return (
-          <Text key={index} style={styles.message}>
-            [{msg.timestamp}] {msg.data}
-          </Text>
+          <View key={index} style={styles.messageContainer}>
+            <Text style={styles.message}>
+              [{msg.timestamp}] {msg.data}
+            </Text>
+            {streamInfoLine}
+          </View>
         );
 
       case "bytes":
+        const hexData = msg.binaryData 
+          ? Array.from(msg.binaryData.slice(0, 256))
+              .map((b) => b.toString(16).padStart(2, '0'))
+              .join(' ')
+              .match(/.{1,48}/g)?.join('\n') || ''
+          : stringToHex(msg.data.substring(0, 256));
         return (
-          <Text key={index} style={styles.bytesMessage}>
-            [{msg.timestamp}]{"\n"}
-            {stringToHex(msg.data)}
-          </Text>
+          <View key={index} style={styles.messageContainer}>
+            <Text style={styles.bytesMessage}>
+              [{msg.timestamp}]
+              {"\n"}
+              {hexData}
+              {msg.binaryData && msg.binaryData.length > 256 ? '\n...' : ''}
+            </Text>
+            {streamInfoLine}
+          </View>
         );
 
       case "image":
@@ -174,7 +338,10 @@ export default function App() {
             : `data:image/png;base64,${msg.data}`;
           return (
             <View key={index} style={styles.imageContainer}>
-              <Text style={styles.imageTimestamp}>[{msg.timestamp}]</Text>
+              <Text style={styles.imageTimestamp}>
+                [{msg.timestamp}]
+              </Text>
+              {streamInfoLine}
               <Image
                 source={{ uri: imageUri }}
                 style={styles.image}
@@ -184,17 +351,35 @@ export default function App() {
           );
         } else {
           return (
-            <Text key={index} style={styles.message}>
-              [{msg.timestamp}] {msg.data.substring(0, 100)}...
-            </Text>
+            <View key={index} style={styles.messageContainer}>
+              <Text style={styles.message}>
+                [{msg.timestamp}] {msg.data.substring(0, 100)}...
+              </Text>
+              {streamInfoLine}
+            </View>
           );
         }
 
+      case "stream":
+        // Show only messages with stream info
+        if (!msg.streamInfo) return null;
+        return (
+          <View key={index} style={styles.messageContainer}>
+            <Text style={styles.streamMessage}>
+              [{msg.timestamp}]
+            </Text>
+            {streamInfoLine}
+          </View>
+        );
+
       default:
         return (
-          <Text key={index} style={styles.message}>
-            [{msg.timestamp}] {msg.data}
-          </Text>
+          <View key={index} style={styles.messageContainer}>
+            <Text style={styles.message}>
+              [{msg.timestamp}] {msg.data}
+            </Text>
+            {streamInfoLine}
+          </View>
         );
     }
   };
@@ -289,6 +474,22 @@ export default function App() {
                 ]}
               >
                 Bytes
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.modeButton,
+                viewMode === "stream" && styles.modeButtonActive,
+              ]}
+              onPress={() => changeViewMode("stream")}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  viewMode === "stream" && styles.modeButtonTextActive,
+                ]}
+              >
+                Stream
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
@@ -459,6 +660,9 @@ const styles = StyleSheet.create({
     padding: 10,
   },
   // Message Styles
+  messageContainer: {
+    marginBottom: 8,
+  },
   systemMessage: {
     fontSize: 13,
     marginBottom: 8,
@@ -472,7 +676,6 @@ const styles = StyleSheet.create({
   },
   message: {
     fontSize: 13,
-    marginBottom: 8,
     padding: 8,
     backgroundColor: "#0d1117",
     borderRadius: 5,
@@ -481,9 +684,29 @@ const styles = StyleSheet.create({
     fontFamily: "monospace",
     color: "#c9d1d9",
   },
+  streamInfo: {
+    fontSize: 11,
+    padding: 6,
+    paddingTop: 4,
+    backgroundColor: "#1a1f2e",
+    borderRadius: 4,
+    marginTop: 4,
+    color: "#a371f7",
+    fontFamily: "monospace",
+    fontWeight: "600",
+  },
+  streamMessage: {
+    fontSize: 11,
+    padding: 6,
+    backgroundColor: "#0d1117",
+    borderRadius: 5,
+    borderLeftWidth: 3,
+    borderLeftColor: "#a371f7",
+    fontFamily: "monospace",
+    color: "#8b949e",
+  },
   bytesMessage: {
     fontSize: 11,
-    marginBottom: 8,
     padding: 8,
     backgroundColor: "#0d1117",
     borderRadius: 5,
