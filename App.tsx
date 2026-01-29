@@ -27,6 +27,7 @@ interface StreamInfo {
   frameSize: number;
   width: number;
   height: number;
+  payloadLen: number;
 }
 
 interface FrameState {
@@ -45,7 +46,7 @@ class FrameAssembler {
   width: number;
   height: number;
   lastUpdate: number;
-  chunkPayloadSize: number = 1200; // CHUNK_PAYLOAD из C++
+  chunkPayloadSize: number = 32768; // CHUNK_PAYLOAD из C++
 
   constructor(header: StreamInfo) {
     this.frameId = header.frameId;
@@ -59,12 +60,37 @@ class FrameAssembler {
   }
 
   addChunk(chunkId: number, payload: Uint8Array): boolean {
-    if (chunkId >= this.totalChunks) return false;
-    if (this.receivedChunks.has(chunkId)) return false;
+    if (chunkId >= this.totalChunks) {
+      console.warn(`⚠️ Chunk ${chunkId} >= total chunks ${this.totalChunks}`);
+      return false;
+    }
+    if (this.receivedChunks.has(chunkId)) {
+      return false;
+    }
 
     // Копируем payload в буфер по смещению
     const offset = chunkId * this.chunkPayloadSize;
-    this.buffer.set(payload, offset);
+
+    // Проверяем границы буфера
+    if (offset >= this.buffer.length) {
+      console.error(
+        `❌ Offset ${offset} >= buffer length ${this.buffer.length}`,
+      );
+      return false;
+    }
+
+    // Для последнего чанка может быть меньше данных
+    const availableSpace = this.buffer.length - offset;
+    const bytesToCopy = Math.min(payload.length, availableSpace);
+
+    if (bytesToCopy < payload.length) {
+      console.log(
+        `📦 Chunk ${chunkId}: copying ${bytesToCopy}/${payload.length} bytes (last chunk)`,
+      );
+    }
+
+    // Копируем только то, что помещается
+    this.buffer.set(payload.subarray(0, bytesToCopy), offset);
     this.receivedChunks.add(chunkId);
     this.lastUpdate = Date.now();
 
@@ -76,7 +102,11 @@ class FrameAssembler {
   }
 
   getJpegData(): Uint8Array {
-    return this.buffer;
+    // Возвращаем только заполненную часть буфера
+    const actualSize =
+      (this.totalChunks - 1) * this.chunkPayloadSize +
+      (this.frameSize - (this.totalChunks - 1) * this.chunkPayloadSize);
+    return this.buffer.slice(0, this.frameSize);
   }
 }
 
@@ -125,7 +155,7 @@ class Reassembler {
 
 export default function App() {
   const [ip, setIp] = useState("185.181.228.243");
-  const [port, setPort] = useState("39181");
+  const [port, setPort] = useState("46343");
   const [messages, setMessages] = useState<MessageData[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("text");
@@ -135,7 +165,7 @@ export default function App() {
   const scrollViewRef = useRef<ScrollView>(null);
   const frameStates = useRef<Map<number, FrameState>>(new Map());
   const reassembler = useRef<Reassembler>(new Reassembler());
-  const fpsCounter = useRef({ count: 0, lastTime: Date.now() });
+  const fpsCounter = useRef({ count: 0, lastTime: 0 });
 
   // MYIR Protocol Constants
   const MYIR_MAGIC = 0x4d594952;
@@ -144,7 +174,7 @@ export default function App() {
   // Parse MYIR header from binary data
   const parseMyirHeader = (data: ArrayBuffer): StreamInfo | null => {
     try {
-      if (data.byteLength < 32) return null;
+      if (data.byteLength < 36) return null; // Header is 36 bytes!
 
       const view = new DataView(data);
       const magic = view.getUint32(0, false); // big-endian
@@ -162,6 +192,7 @@ export default function App() {
       const frameSize = view.getUint32(24, false);
       const chunkId = view.getUint16(28, false);
       const chunksTotal = view.getUint16(30, false);
+      const payloadLen = view.getUint16(32, false); // Читаем payload_len
 
       return {
         frameId,
@@ -170,6 +201,7 @@ export default function App() {
         frameSize,
         width,
         height,
+        payloadLen,
       };
     } catch (e) {
       console.error("MYIR parse error:", e);
@@ -177,13 +209,16 @@ export default function App() {
     }
   };
 
-  // Convert Uint8Array to base64 string
+  // Convert Uint8Array to base64 string (optimized)
   const uint8ArrayToBase64 = (bytes: Uint8Array): string => {
+    const chunkSize = 8192;
     let binary = "";
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(bytes[i]);
+
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+      binary += String.fromCharCode.apply(null, Array.from(chunk));
     }
+
     return btoa(binary);
   };
 
@@ -222,6 +257,11 @@ export default function App() {
 
       ws.onopen = () => {
         setIsConnected(true);
+        // Reset FPS counter
+        fpsCounter.current = { count: 0, lastTime: 0 };
+        setFps(0);
+        setCurrentFrame(null);
+
         setMessages((prev) => [
           ...prev,
           {
@@ -252,38 +292,79 @@ export default function App() {
             }
             frameState.receivedChunks.add(header.chunkId);
 
-            // Extract payload (skip 32-byte header)
-            const HDR_SIZE = 32;
-            const payloadLen = buffer.byteLength - HDR_SIZE;
-            const payload = new Uint8Array(buffer, HDR_SIZE, payloadLen);
+            // Extract payload (skip 36-byte header, use payload_len from header)
+            const HDR_SIZE = 36; // C++ struct size: 4+4+4+8+8+8 = 36 bytes!
+            const payload = new Uint8Array(buffer, HDR_SIZE, header.payloadLen);
+
+            // Log first chunk of each frame
+            if (header.chunkId === 0) {
+              console.log(
+                `🎬 New frame ${header.frameId} started: ${header.width}x${header.height}, ${header.chunksTotal} chunks, ${header.frameSize} bytes total`,
+              );
+              console.log(`👀 First chunk payload: ${header.payloadLen} bytes`);
+            }
 
             // Push to reassembler
             const completeFrame = reassembler.current.push(header, payload);
 
             if (completeFrame) {
-              // Frame complete! Convert to base64 for Image component
-              const jpegData = completeFrame.getJpegData();
-              const base64 = uint8ArrayToBase64(jpegData);
-              const imageUri = `data:image/jpeg;base64,${base64}`;
-
-              setCurrentFrame(imageUri);
-
               // Update FPS counter
-              fpsCounter.current.count++;
               const now = Date.now();
+
+              // Initialize lastTime on first frame
+              if (fpsCounter.current.lastTime === 0) {
+                fpsCounter.current.lastTime = now;
+              }
+
+              fpsCounter.current.count++;
               const elapsed = now - fpsCounter.current.lastTime;
+              let currentFps = fps;
+
               if (elapsed >= 1000) {
-                const currentFps = (fpsCounter.current.count * 1000) / elapsed;
+                currentFps = (fpsCounter.current.count * 1000) / elapsed;
                 setFps(Math.round(currentFps * 10) / 10);
                 fpsCounter.current.count = 0;
                 fpsCounter.current.lastTime = now;
               }
 
+              // Frame complete! Convert to base64 for Image component
+              const jpegData = completeFrame.getJpegData();
+
+              console.log(
+                `🎬 Frame ${header.frameId}: JPEG size = ${jpegData.length} bytes`,
+              );
+
+              // Check JPEG magic bytes (0xFF 0xD8)
+              if (jpegData.length > 2) {
+                const isJpeg = jpegData[0] === 0xff && jpegData[1] === 0xd8;
+                console.log(
+                  `🔍 JPEG magic bytes: ${jpegData[0].toString(16)} ${jpegData[1].toString(16)} - ${isJpeg ? "✅ Valid JPEG" : "❌ NOT JPEG!"}`,
+                );
+
+                if (!isJpeg) {
+                  console.error(
+                    "❌ Invalid JPEG data! First 16 bytes:",
+                    Array.from(jpegData.slice(0, 16))
+                      .map((b) => b.toString(16).padStart(2, "0"))
+                      .join(" "),
+                  );
+                }
+              }
+
+              // Convert to base64
+              const base64 = uint8ArrayToBase64(jpegData);
+              console.log(
+                `📦 Base64 length = ${base64.length} chars, first 50: ${base64.substring(0, 50)}`,
+              );
+
+              const imageUri = `data:image/jpeg;base64,${base64}`;
+              setCurrentFrame(imageUri);
+
               // Clean up old frame states
               frameStates.current.delete(header.frameId);
 
               console.log(
-                `✅ Frame ${header.frameId} complete: ${header.width}x${header.height}, FPS: ${fps}`,
+                `✅ Frame ${header.frameId} complete: ${header.width}x${header.height}, FPS: ${currentFps.toFixed(1)}`,
               );
             }
 
@@ -589,7 +670,26 @@ export default function App() {
             source={{ uri: currentFrame }}
             style={styles.videoFrame}
             resizeMode="contain"
+            onLoad={() => console.log("✅ Image loaded successfully")}
+            onError={(error) =>
+              console.error("❌ Image load error:", error.nativeEvent.error)
+            }
           />
+        </View>
+      )}
+
+      {/* Show placeholder when no frame yet */}
+      {isConnected && !currentFrame && (
+        <View style={styles.videoContainer}>
+          <View style={styles.videoHeader}>
+            <Text style={styles.videoTitle}>📹 Live Stream</Text>
+            <Text style={styles.fpsText}>Waiting for frames...</Text>
+          </View>
+          <View style={styles.videoPlaceholder}>
+            <Text style={styles.placeholderText}>
+              ⏳ Loading video stream...
+            </Text>
+          </View>
         </View>
       )}
 
@@ -792,6 +892,18 @@ const styles = StyleSheet.create({
     width: "100%",
     height: 250,
     backgroundColor: "#000",
+  },
+  videoPlaceholder: {
+    width: "100%",
+    height: 250,
+    backgroundColor: "#000",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  placeholderText: {
+    color: "#888",
+    fontSize: 14,
+    fontFamily: "monospace",
   },
   // Console Styles
   consoleContainer: {
