@@ -155,7 +155,7 @@ class Reassembler {
 
 export default function App() {
   const [ip, setIp] = useState("185.181.228.243");
-  const [port, setPort] = useState("46343");
+  const [port, setPort] = useState("35189");
   const [messages, setMessages] = useState<MessageData[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("text");
