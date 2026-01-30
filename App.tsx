@@ -143,7 +143,7 @@ export default function App() {
   const [currentFrame, setCurrentFrame] = useState<string | null>(null);
   const [fps, setFps] = useState<number>(0);
   const [connectionStatus, setConnectionStatus] = useState<string>("");
-  
+
   const websocket = useRef<WebSocket | null>(null);
   const reassembler = useRef<Reassembler>(new Reassembler());
   const fpsCounter = useRef({ count: 0, lastTime: 0 });
@@ -253,7 +253,9 @@ export default function App() {
               const base64 = uint8ArrayToBase64(jpegData);
               const imageUri = `data:image/jpeg;base64,${base64}`;
               setCurrentFrame(imageUri);
-              setConnectionStatus(`🟢 Streaming ${header.width}x${header.height}`);
+              setConnectionStatus(
+                `🟢 Streaming ${header.width}x${header.height}`,
+              );
             }
 
             reassembler.current.gc();
